@@ -1348,7 +1348,16 @@ function renderBottomNav(){
     const b = document.createElement('button');
     b.className = 'p-2 transition-transform active:scale-95 ' + (state.tab===it.key ? 'text-gray-900' : 'text-gray-400');
     b.innerHTML = `<svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="${it.path}"/></svg>`;
-    b.addEventListener('click', ()=>{ state.tab = it.key; render(); });
+    b.addEventListener('click', ()=>{
+      // 이미 열려 있는 탭의 아이콘을 다시 누르면: 재렌더 없이 맨 위로 부드럽게 스크롤
+      if(state.tab === it.key){
+        const m = document.getElementById('tab-main');
+        if(m){ m.scrollTo({ top:0, behavior:'smooth' }); }
+        tabScrollPositions[it.key] = 0;
+        return;
+      }
+      state.tab = it.key; render();
+    });
     nav.appendChild(b);
   });
   return nav;
