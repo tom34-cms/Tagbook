@@ -28,6 +28,7 @@
   @keyframes sheetUp{ from{ transform:translateY(24px); opacity:0;} to{ transform:translateY(0); opacity:1;} }
   .fade-enter{ animation:fadeIn .18s ease-out; }
   @keyframes fadeIn{ from{ opacity:0;} to{ opacity:1;} }
+  .no-anim, .no-anim *{ animation:none !important; }
 </style>
 </head>
 <body class="flex flex-col h-dvh max-w-md mx-auto border-x border-gray-100/50 shadow-2xl relative overflow-hidden">
@@ -50,6 +51,55 @@ let outsideClickHandler = null;
 let lastRenderedTab = null;
 const tabScrollPositions = { calendar:0, gallery:0, search:0 };
 let firebaseReady = false;
+const photoTried = new Set();      // 원본 사진 중복 요청 방지
+let renderTimer = null;
+let lastOverlays = new Set(), seenOverlays = new Set();
+let vvCleanup = null;
+// 사진이 뒤늦게 로드될 때 화면 전체를 즉시 다시 그리지 않고 묶어서 한 번만 갱신 (입력 중이면 건너뜀)
+function scheduleRender(){
+  if(renderTimer) return;
+  renderTimer = setTimeout(()=>{
+    renderTimer = null;
+    const a = document.activeElement;
+    if(a && (a.tagName==='INPUT' || a.tagName==='TEXTAREA')) return;
+    render();
+  }, 250);
+}
+// 이미 열려 있던 팝업은 재렌더 시 애니메이션(깜빡임) 없이 그대로 유지
+function addOverlay(app, key, el){
+  if(lastOverlays.has(key)) el.classList.add('no-anim');
+  seenOverlays.add(key);
+  app.appendChild(el);
+}
+// 키보드가 올라와도 팝업이 키보드 위에 붙어 있도록 보이는 화면 크기에 맞춤
+function fitToVisualViewport(bg){
+  if(vvCleanup){ vvCleanup(); vvCleanup = null; }
+  const vv = window.visualViewport; if(!vv) return;
+  const fit = ()=>{ bg.style.top = vv.offsetTop+'px'; bg.style.bottom = 'auto'; bg.style.height = vv.height+'px'; };
+  vv.addEventListener('resize', fit); vv.addEventListener('scroll', fit); fit();
+  vvCleanup = ()=>{ vv.removeEventListener('resize', fit); vv.removeEventListener('scroll', fit); };
+}
+// 아이템 정렬: 브랜드 이름 오름차순 (브랜드 없는 건 맨 뒤, 같은 브랜드는 제품명순)
+function sortByBrand(list){
+  return list.slice().sort((a,b)=>{
+    const ba = (a.brand||'').trim(), bb = (b.brand||'').trim();
+    if(!ba && !bb) return (a.name||'').localeCompare(b.name||'','ko');
+    if(!ba) return 1;
+    if(!bb) return -1;
+    return ba.localeCompare(bb,'ko',{sensitivity:'base'}) || (a.name||'').localeCompare(b.name||'','ko');
+  });
+}
+// 코디 안 아이템: 선택한 순서가 아니라 카테고리 순서(신발→상의→아우터→…)로
+function sortIdsByCategory(ids){
+  return ids.map((id,i)=>({id,i,it:state.items.find(x=>x.id===id)})).filter(x=>x.it)
+    .sort((a,b)=> (CAT_MAIN.indexOf(a.it.category)-CAT_MAIN.indexOf(b.it.category)) || (a.i-b.i)).map(x=>x.id);
+}
+function refreshSearchArea(){
+  const old = document.getElementById('search-content-area'); if(!old) return;
+  const fresh = renderSearchTab().querySelector('#search-content-area');
+  if(fresh) old.replaceWith(fresh);
+}
+let searchTimer = null;
 try{
   if(firebaseConfig.apiKey !== "YOUR_API_KEY" && typeof firebase !== 'undefined'){
     firebase.initializeApp(firebaseConfig);
@@ -256,7 +306,7 @@ function makeThumbFromDataURL(dataURL){
 // 새 아이템 등록 폼의 빈 초안 생성 (모든 사이즈 필드를 미리 빈 값으로 포함)
 function blankItemForm(cat){
   const category = cat || CAT_MAIN[0];
-  const base = { category, subCategory: (CAT_SUB[category]||[])[0] || '', catExpand: null, photo:null, photoThumb:null, brand:'', name:'', modelNo:'', purchaseDate:'', price:'', sizeNote:'' };
+  const base = { category, subCategory: (CAT_SUB[category]||[])[0] || '', catExpand: null, photo:null, photoThumb:null, brand:'', name:'', modelNo:'', purchaseDate:'', price:'', store:'', sizeNote:'' };
   SIZE_KEYS.forEach(k=>{ base[k] = ''; });
   return base;
 }
@@ -265,7 +315,7 @@ function itemToForm(it){
   const base = blankItemForm(it.category);
   base.subCategory = it.subCategory || (CAT_SUB[it.category]||[])[0] || '';
   base.photo = it.photo; base.photoThumb = it.photoThumb || null; base.brand = it.brand||''; base.name = it.name||''; base.modelNo = it.modelNo||'';
-  base.purchaseDate = it.purchaseDate||''; base.price = it.price||''; base.sizeNote = it.sizeNote||'';
+  base.purchaseDate = it.purchaseDate||''; base.price = it.price||''; base.store = it.store || parseSizeNote(it.sizeNote)['구매처'] || ''; base.sizeNote = it.sizeNote||'';
   SIZE_KEYS.forEach(k=>{ base[k] = it[k] || ''; });
   return base;
 }
@@ -319,7 +369,8 @@ async function deletePhoto(type, id){
 // 원본 사진 1장을 필요할 때만 불러와 photoCache에 담고 화면을 갱신한다.
 // 상세 화면(코디 상세/아이템 상세/수정 폼)을 열 때 호출한다. 이미 캐시에 있으면 아무것도 안 함.
 async function ensurePhotoLoaded(type, id){
-  if(!id || state.photoCache[id]) return;
+  if(!id || state.photoCache[id] || photoTried.has(id)) return;
+  photoTried.add(id);
   try{
     let dataURL = null;
     if(state.storageMode === 'firebase'){
@@ -331,8 +382,8 @@ async function ensurePhotoLoaded(type, id){
     } else if(state.storageMode === 'local'){
       dataURL = localStorage.getItem(photoLocalPrefix(type)+id);
     }
-    if(dataURL){ state.photoCache[id] = dataURL; render(); }
-  }catch(e){ console.error('원본 사진 로드 실패:', type, id, e); }
+    if(dataURL){ state.photoCache[id] = dataURL; scheduleRender(); }
+  }catch(e){ photoTried.delete(id); console.error('원본 사진 로드 실패:', type, id, e); }
 }
 // 그리기 시점에 쓸 원본 URL: 방금 업로드해서 메모리에 있는 값 > 캐시된 값 > (아직 없으면) 썸네일로 대체하고 백그라운드 로드 시작
 function fullPhotoOf(type, rec){
@@ -570,7 +621,7 @@ function sortItems(list, key, dir){
     return a.purchaseDate.localeCompare(b.purchaseDate) * mul;
   });
   else if(key === 'price') arr.sort((a,b)=> ((Number(a.price)||0) - (Number(b.price)||0)) * mul);
-  else arr.sort((a,b)=> (b.id > a.id ? 1 : -1)); // recent (registered)
+  else return sortByBrand(arr); // 기본: 브랜드 이름 오름차순
   return arr;
 }
 
@@ -630,6 +681,8 @@ function render(){
   if(prevMain && lastRenderedTab){ tabScrollPositions[lastRenderedTab] = prevMain.scrollTop; }
 
   app.innerHTML = '';
+  if(vvCleanup){ vvCleanup(); vvCleanup = null; }
+  seenOverlays = new Set();
 
   if(outsideClickHandler){ document.removeEventListener('click', outsideClickHandler); outsideClickHandler = null; }
 
@@ -650,16 +703,17 @@ function render(){
   const newMain = document.getElementById('tab-main');
   if(newMain) newMain.scrollTop = tabScrollPositions[state.tab] || 0;
 
-  if(state.registerDraft) app.appendChild(renderOutfitRegisterView());
-  if(state.itemFlow) app.appendChild(renderItemFlowModal());
-  if(state.coordiDetailId) app.appendChild(renderCoordiDetailModal());
-  if(state.itemBriefId) app.appendChild(renderItemBriefSheet());
-  if(state.itemFreqOutfitsId) app.appendChild(renderItemFreqOutfitsSheet());
-  if(state.itemFullId) app.appendChild(renderItemFullModal());
-  if(state.categoryPopupOpen) app.appendChild(renderCategoryPopup());
-  if(state.sizePopupOpen) app.appendChild(renderSizePopup());
-  if(state.confirmDialog) app.appendChild(renderConfirmModal());
-  if(state.fullscreenPhoto) app.appendChild(renderFullscreenPhoto());
+  if(state.registerDraft) addOverlay(app, 'reg', renderOutfitRegisterView());
+  if(state.itemFlow) addOverlay(app, 'flow:'+state.itemFlow.mode, renderItemFlowModal());
+  if(state.coordiDetailId) addOverlay(app, 'coordi', renderCoordiDetailModal());
+  if(state.itemBriefId) addOverlay(app, 'brief', renderItemBriefSheet());
+  if(state.itemFreqOutfitsId) addOverlay(app, 'freq', renderItemFreqOutfitsSheet());
+  if(state.itemFullId) addOverlay(app, 'full', renderItemFullModal());
+  if(state.categoryPopupOpen) addOverlay(app, 'cat', renderCategoryPopup());
+  if(state.sizePopupOpen) addOverlay(app, 'size', renderSizePopup());
+  if(state.confirmDialog) addOverlay(app, 'confirm', renderConfirmModal());
+  if(state.fullscreenPhoto) addOverlay(app, 'fs', renderFullscreenPhoto());
+  lastOverlays = seenOverlays;
 
   if(state.monthPickerOpen){
     setTimeout(()=>{
@@ -993,7 +1047,8 @@ function renderSearchTab(){
 
   searchBar.querySelector('#item-search-input').addEventListener('input', e=>{
     state.searchQuery = e.target.value;
-    render();
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(refreshSearchArea, 120);
   });
 
   if(state.items.length === 0){
@@ -1189,7 +1244,7 @@ function renderSearchTab(){
 function renderItemFreqOutfitsSheet(){
   const it = state.items.find(x=>x.id===state.itemFreqOutfitsId);
   const bg = document.createElement('div');
-  bg.className = 'fixed inset-0 bg-black/40 z-50 flex justify-end flex-col fade-enter';
+  bg.className = 'fixed inset-0 bg-black/40 z-[55] flex justify-end flex-col fade-enter';
   if(!it){ state.itemFreqOutfitsId = null; return bg; }
   const outfits = state.outfits.filter(o=>o.itemIds.includes(it.id)).sort((a,b)=> b.date.localeCompare(a.date));
   const sheet = document.createElement('div');
@@ -1214,7 +1269,7 @@ function renderItemFreqOutfitsSheet(){
         <p class="text-[9px] font-semibold text-white truncate">${fmtDate(o.date)}</p>
       </div>
     `;
-    card.addEventListener('click', ()=>{ state.itemFreqOutfitsId = null; state.coordiDetailId = o.id; render(); });
+    card.addEventListener('click', ()=>{ state.itemFreqOutfitsId = null; state.itemFullId = null; state.coordiDetailId = o.id; render(); });
     grid.appendChild(card);
   });
   bg.addEventListener('click', e=>{ if(e.target===bg){ state.itemFreqOutfitsId=null; render(); } });
@@ -1468,7 +1523,7 @@ function renderCoordiDetailModal(){
   const bg = document.createElement('div');
   bg.className = 'fixed inset-0 bg-[#F2F2F3] z-40 flex flex-col overflow-y-auto fade-enter';
   if(!o){ state.coordiDetailId = null; return bg; }
-  const items = o.itemIds.map(id=>state.items.find(x=>x.id===id)).filter(Boolean);
+  const items = sortIdsByCategory(o.itemIds).map(id=>state.items.find(x=>x.id===id));
   const presentCats = CAT_MAIN.filter(c=>items.some(it=>it.category===c));
   const filteredItems = state.coordiFilterCat==='all' ? items : items.filter(it=>it.category===state.coordiFilterCat);
   bg.innerHTML = `
@@ -1618,8 +1673,9 @@ function renderItemFullModal(){
         <p class="text-xs text-gray-500 pt-1">품번 <span class="text-gray-900 font-semibold">${it.modelNo || '-'}</span></p>
         <p class="text-xs text-gray-500">구매 가격 <span class="text-gray-900 font-semibold">${fmtWon(it.price)}</span></p>
         <p class="text-xs text-gray-500">구매일 <span class="text-gray-900 font-semibold">${it.purchaseDate ? fmtDate(it.purchaseDate) : '-'}</span></p>
+        <p class="text-xs text-gray-500">구매처 <span class="text-gray-900 font-semibold">${it.store || parseSizeNote(it.sizeNote)['구매처'] || '-'}</span></p>
         <p class="text-xs text-gray-500">소분류 <span class="text-gray-900 font-semibold">${it.subCategory || '-'}</span></p>
-        <p class="text-xs text-gray-500">착장 빈도 <span class="text-gray-900 font-semibold">${outfitsUsingItem(it.id)}회 착용</span></p>
+        <p class="text-xs text-gray-500">착장 빈도 ${outfitsUsingItem(it.id) > 0 ? `<button id="open-freq" class="text-gray-900 font-semibold underline underline-offset-2">${outfitsUsingItem(it.id)}회 착용 ›</button>` : `<span class="text-gray-900 font-semibold">0회 착용</span>`}</p>
       </div>
       <div class="bg-white p-4 rounded-2xl border border-gray-100 space-y-2">
         <h4 class="text-xs font-bold text-gray-900 border-b pb-1">노트</h4>
@@ -1629,6 +1685,8 @@ function renderItemFullModal(){
     </div>
   `;
   bg.querySelector('#close-full').addEventListener('click', ()=>{ state.itemFullId=null; render(); });
+  const openFreq = bg.querySelector('#open-freq');
+  if(openFreq) openFreq.addEventListener('click', ()=>{ state.itemFreqOutfitsId = it.id; render(); });
   bg.querySelector('#edit-item').addEventListener('click', ()=>{
     state.itemFullId = null;
     state.itemFlow = { mode:'edit', itemId: it.id, form: itemToForm(it) };
@@ -1689,7 +1747,7 @@ function renderOutfitRegisterView(){
   `;
 
   const chipList = bg.querySelector('#chip-list');
-  d.itemIds.forEach(id=>{
+  sortIdsByCategory(d.itemIds).forEach(id=>{
     const it = state.items.find(x=>x.id===id);
     if(!it) return;
     const chip = document.createElement('div');
@@ -1842,7 +1900,7 @@ function renderItemFlowModal(){
   const bg = document.createElement('div');
   bg.className = 'fixed inset-0 bg-black/40 z-50 flex justify-end flex-col fade-enter';
   const sheet = document.createElement('div');
-  sheet.className = 'bg-white rounded-t-3xl p-6 space-y-4 sheet-enter max-h-[85vh] overflow-y-auto';
+  sheet.className = 'bg-white rounded-t-3xl p-6 space-y-4 sheet-enter max-h-full overflow-y-auto overscroll-contain';
   const flow = state.itemFlow;
 
   if(flow.mode === 'choice'){
@@ -1860,12 +1918,14 @@ function renderItemFlowModal(){
     sheet.querySelector('#pick-new').addEventListener('click', ()=>{ state.itemFlow = { mode:'new', form: blankItemForm() }; render(); });
     sheet.querySelector('#close-flow').addEventListener('click', ()=>{ state.itemFlow=null; render(); });
   } else if(flow.mode === 'pick'){
-    const q = state.pickerSearch.trim().toLowerCase();
-    const list = state.items.filter(it=>{
-      if(state.registerDraft && state.registerDraft.itemIds.includes(it.id)) return false;
-      if(!q) return true;
-      return (it.brand||'').toLowerCase().includes(q) || (it.name||'').toLowerCase().includes(q) || (it.modelNo||'').toLowerCase().includes(q);
-    });
+    const getPickList = ()=>{
+      const q = state.pickerSearch.trim().toLowerCase();
+      return sortByBrand(state.items.filter(it=>{
+        if(state.registerDraft && state.registerDraft.itemIds.includes(it.id)) return false;
+        if(!q) return true;
+        return (it.brand||'').toLowerCase().includes(q) || (it.name||'').toLowerCase().includes(q) || (it.modelNo||'').toLowerCase().includes(q);
+      }));
+    };
     sheet.innerHTML = `
       <div class="w-12 h-1 bg-gray-200 rounded-full mx-auto"></div>
       <h3 class="font-bold text-lg">기존 아이템에서 선택</h3>
@@ -1874,22 +1934,34 @@ function renderItemFlowModal(){
         <input type="text" id="pick-search" placeholder="브랜드, 이름, 품번 검색" value="${state.pickerSearch}" class="bg-transparent outline-none text-sm w-full"/>
       </div>
       <div class="grid grid-cols-3 gap-2" id="pick-grid"></div>
-      ${list.length===0 ? `<p class="text-center text-xs text-gray-400 py-6">등록된 아이템이 없어요</p>` : ''}
+      <p id="pick-empty" class="hidden text-center text-xs text-gray-400 py-6">해당하는 아이템이 없어요</p>
       <button id="back-choice" class="w-full py-2 text-xs text-gray-700 font-semibold">← 뒤로</button>
     `;
     const g = sheet.querySelector('#pick-grid');
-    list.forEach(it=>{
-      const c = document.createElement('div');
-      c.className = 'bg-gray-50 rounded-xl p-1.5 text-center cursor-pointer';
-      c.innerHTML = `<img src="${it.photoThumb||it.photo}" class="w-full h-16 object-cover rounded-lg"/><p class="text-[10px] font-bold truncate mt-1">${it.brand||it.category}</p>`;
-      c.addEventListener('click', ()=>{
-        state.registerDraft.itemIds.push(it.id);
-        state.itemFlow = null;
-        render();
+    const emptyEl = sheet.querySelector('#pick-empty');
+    const fillPick = ()=>{
+      const list = getPickList();
+      g.innerHTML = '';
+      emptyEl.classList.toggle('hidden', list.length > 0);
+      list.forEach(it=>{
+        const c = document.createElement('div');
+        c.className = 'bg-gray-50 rounded-xl p-1.5 text-center cursor-pointer';
+        c.innerHTML = `<img src="${it.photoThumb||it.photo}" loading="lazy" decoding="async" class="w-full h-16 object-cover rounded-lg"/><p class="text-[10px] font-bold truncate mt-1">${it.brand||it.category}</p>`;
+        c.addEventListener('click', ()=>{
+          state.registerDraft.itemIds.push(it.id);
+          state.itemFlow = null;
+          render();
+        });
+        g.appendChild(c);
       });
-      g.appendChild(c);
+    };
+    fillPick();
+    let pickTimer = null;
+    sheet.querySelector('#pick-search').addEventListener('input', e=>{
+      state.pickerSearch = e.target.value;   // 입력창은 그대로 두고 목록만 갱신
+      clearTimeout(pickTimer);
+      pickTimer = setTimeout(fillPick, 120);
     });
-    sheet.querySelector('#pick-search').addEventListener('input', e=>{ state.pickerSearch = e.target.value; render(); });
     sheet.querySelector('#back-choice').addEventListener('click', ()=>{ state.itemFlow = { mode:'choice' }; render(); });
   } else if(flow.mode === 'new' || flow.mode === 'edit'){
     const isEdit = flow.mode === 'edit';
@@ -1913,7 +1985,10 @@ function renderItemFlowModal(){
         <div class="min-w-0"><label class="text-xs font-bold text-gray-800">품번</label><input type="text" id="f-model" value="${f.modelNo}" placeholder="예: MR993GL" class="block w-full min-w-0 box-border mt-1 px-3 h-11 rounded-xl border border-gray-200 bg-white text-base"/></div>
         <div class="min-w-0"><label class="text-xs font-bold text-gray-800">구매일</label><input type="date" id="f-pdate" value="${f.purchaseDate}" class="block w-full min-w-0 box-border mt-1 px-3 h-11 rounded-xl border border-gray-200 bg-white text-base flex items-center"/></div>
       </div>
-      <div><label class="text-xs font-bold text-gray-800">구매 가격 (원)</label><input type="number" id="f-price" value="${f.price}" placeholder="예: 189000" class="block w-full box-border mt-1 px-3 h-11 rounded-xl border border-gray-200 bg-white text-base"/></div>
+      <div class="grid grid-cols-2 gap-3">
+        <div class="min-w-0"><label class="text-xs font-bold text-gray-800">구매 가격 (원)</label><input type="number" id="f-price" value="${f.price}" placeholder="예: 189000" class="block w-full min-w-0 box-border mt-1 px-3 h-11 rounded-xl border border-gray-200 bg-white text-base"/></div>
+        <div class="min-w-0"><label class="text-xs font-bold text-gray-800">구매처</label><input type="text" id="f-store" value="${f.store||''}" placeholder="예: 무신사" class="block w-full min-w-0 box-border mt-1 px-3 h-11 rounded-xl border border-gray-200 bg-white text-base"/></div>
+      </div>
       <div id="size-fields-wrap"></div>
       <div><label class="text-xs font-bold text-gray-800">노트</label><textarea id="f-note" rows="3" placeholder="자유롭게 메모를 남겨보세요" class="block w-full box-border mt-1 px-3 py-2 rounded-xl border border-gray-200 bg-white text-base">${f.sizeNote}</textarea></div>
       <div class="flex justify-between items-center pt-1">
@@ -1939,6 +2014,7 @@ function renderItemFlowModal(){
     sheet.querySelector('#f-model').addEventListener('input', e=>f.modelNo=e.target.value);
     sheet.querySelector('#f-pdate').addEventListener('input', e=>f.purchaseDate=e.target.value);
     sheet.querySelector('#f-price').addEventListener('input', e=>f.price=e.target.value);
+    sheet.querySelector('#f-store').addEventListener('input', e=>f.store=e.target.value);
     sheet.querySelector('#f-note').addEventListener('input', e=>f.sizeNote=e.target.value);
     sheet.querySelector('#back-choice').addEventListener('click', ()=>{
       if(isEdit){ state.itemFlow = null; state.itemFullId = flow.itemId; render(); }
@@ -1947,7 +2023,7 @@ function renderItemFlowModal(){
     sheet.querySelector('#save-item').addEventListener('click', ()=>{
       if(!f.photo && !f.photoThumb){ alert('아이템 사진을 업로드해주세요.'); return; }
       if(!f.brand && !f.name){ alert('브랜드 또는 제품명을 입력해주세요.'); return; }
-      const payload = { category:f.category, subCategory:f.subCategory, photo:f.photo, photoThumb:f.photoThumb||null, brand:f.brand, name:f.name, modelNo:f.modelNo, purchaseDate:f.purchaseDate, price:f.price, sizeNote:f.sizeNote };
+      const payload = { category:f.category, subCategory:f.subCategory, photo:f.photo, photoThumb:f.photoThumb||null, brand:f.brand, name:f.name, modelNo:f.modelNo, purchaseDate:f.purchaseDate, price:f.price, store:f.store||'', sizeNote:f.sizeNote };
       SIZE_KEYS.forEach(k=>{ payload[k] = f[k]; });
       if(isEdit){
         const target = state.items.find(x=>x.id===flow.itemId);
@@ -1969,6 +2045,7 @@ function renderItemFlowModal(){
 
   bg.appendChild(sheet);
   bg.addEventListener('click', e=>{ if(e.target===bg){ state.itemFlow=null; render(); } });
+  fitToVisualViewport(bg);
   return bg;
 }
 
