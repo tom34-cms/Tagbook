@@ -80,13 +80,15 @@ function fitToVisualViewport(bg){
   vvCleanup = ()=>{ vv.removeEventListener('resize', fit); vv.removeEventListener('scroll', fit); };
 }
 // 아이템 정렬: 브랜드 이름 오름차순 (브랜드 없는 건 맨 뒤, 같은 브랜드는 제품명순)
+function brandGroup(t){ const c=(t||'').trim().charAt(0); if(/[A-Za-z0-9]/.test(c)) return 0; if(/[\u3131-\u318E\uAC00-\uD7A3]/.test(c)) return 1; return 2; }
+function brandCmp(a,b){ const ga=brandGroup(a), gb=brandGroup(b); if(ga!==gb) return ga-gb; return a.localeCompare(b, ga===1?'ko':'en', {sensitivity:'base', numeric:true}); }
 function sortByBrand(list){
   return list.slice().sort((a,b)=>{
     const ba = (a.brand||'').trim(), bb = (b.brand||'').trim();
     if(!ba && !bb) return (a.name||'').localeCompare(b.name||'','ko');
     if(!ba) return 1;
     if(!bb) return -1;
-    return ba.localeCompare(bb,'ko',{sensitivity:'base'}) || (a.name||'').localeCompare(b.name||'','ko');
+    return brandCmp(ba,bb) || (a.name||'').localeCompare(b.name||'','ko');
   });
 }
 // 코디 안 아이템: 선택한 순서가 아니라 카테고리 순서(신발→상의→아우터→…)로
@@ -100,6 +102,127 @@ function refreshSearchArea(){
   if(fresh) old.replaceWith(fresh);
 }
 let searchTimer = null;
+let lastCoordiId = null;
+const photoPromises = {};
+const MAX_PICS = { outfit: 8, item: 5 };
+function fetchPhoto(type, id){
+  if(!id) return Promise.resolve(null);
+  if(state.photoCache[id]) return Promise.resolve(state.photoCache[id]);
+  if(photoPromises[id]) return photoPromises[id];
+  photoPromises[id] = (async()=>{
+    await Promise.resolve();
+    try{
+      let d = null;
+      if(state.storageMode==='firebase'){ const doc = await db.collection('tagbook').doc(state.syncCode).collection(photoCollName(type)).doc(id).get(); if(doc.exists) d = doc.data().photo; }
+      else if(state.storageMode==='cloud'){ const r = await window.storage.get(photoKeyPrefix(type)+id, false); if(r && r.value) d = r.value; }
+      else if(state.storageMode==='local'){ d = localStorage.getItem(photoLocalPrefix(type)+id); }
+      if(d) state.photoCache[id] = d;
+      return d;
+    }catch(e){ console.error('사진 로드 실패:', id, e); return null; }
+    finally{ delete photoPromises[id]; }
+  })();
+  return photoPromises[id];
+}
+// 기록 1개의 사진 id 목록 (맨 앞이 대표). 예전 기록은 사진 1장 = 기록 id 그대로
+function photoIdsOf(rec){ return (rec.photoIds && rec.photoIds.length) ? rec.photoIds : ((rec.photoThumb||rec.photo) ? [rec.id] : []); }
+function picsOf(type, rec){
+  return photoIdsOf(rec).map((id,i)=>({ id, src: state.photoCache[id] || (i===0 ? (rec.photo||rec.photoThumb||'') : ''), fresh:false }));
+}
+// 편집 화면에서 정리한 사진 목록을 저장 (새 사진 저장, 빠진 사진 삭제, 대표 썸네일 갱신)
+async function persistPics(type, rec, pics, oldRec){
+  try{
+    const oldIds = photoIdsOf(oldRec === undefined ? rec : (oldRec || {}));
+    const oldCover = oldIds[0], oldThumb = (oldRec === undefined ? rec : oldRec) && (oldRec === undefined ? rec : oldRec).photoThumb;
+    const ids = pics.map(p=>p.id);
+    for(const p of pics){ if(p.fresh && p.src){ await savePhoto(type, p.id, p.src); state.photoCache[p.id] = p.src; p.fresh = false; } }
+    for(const id of oldIds){ if(!ids.includes(id)){ await deletePhoto(type, id); delete state.photoCache[id]; } }
+    rec.photoIds = ids;
+    const cover = pics[0];
+    if(cover && cover.id === oldCover && oldThumb && !cover.fresh){ rec.photoThumb = oldThumb; }
+    else if(cover){
+      const full = state.photoCache[cover.id] || cover.src || await fetchPhoto(type, cover.id);
+      rec.photoThumb = full ? await makeThumbFromDataURL(full) : null;
+    } else rec.photoThumb = null;
+    delete rec.photo;
+  }catch(e){ console.error('사진 저장 실패:', e); alert('사진 저장에 실패했어요. 인터넷 연결을 확인하고 다시 시도해주세요.'); }
+}
+// 사진 편집기: 여러 장 선택, 대표(맨 앞) 표시, ◀ ▶ 로 순서 변경, × 삭제
+function mountPhotoEditor(el, pics, type, emptyLabel){
+  const max = MAX_PICS[type];
+  const redraw = ()=>{
+    el.innerHTML = '';
+    const row = document.createElement('div');
+    row.className = 'flex gap-2 overflow-x-auto custom-scroll pb-1';
+    pics.forEach((p,i)=>{
+      const t = document.createElement('div');
+      t.className = 'relative shrink-0 w-24 h-32 rounded-xl overflow-hidden bg-gray-100 border border-gray-200';
+      t.innerHTML = `<img class="w-full h-full object-cover"/>
+        ${i===0 ? '<span class="absolute top-1 left-1 text-[9px] font-bold bg-gray-900 text-white px-1.5 py-0.5 rounded-full">대표</span>' : ''}
+        <button type="button" class="rm absolute top-1 right-1 w-5 h-5 rounded-full bg-red-400 text-white text-[10px]">×</button>
+        <div class="absolute bottom-1 inset-x-1 flex justify-between">
+          <button type="button" class="lf w-6 h-6 rounded-full bg-white/90 text-[10px] ${i===0?'opacity-30':''}">◀</button>
+          <button type="button" class="rt w-6 h-6 rounded-full bg-white/90 text-[10px] ${i===pics.length-1?'opacity-30':''}">▶</button>
+        </div>`;
+      const img = t.querySelector('img');
+      if(p.src) img.src = p.src; else fetchPhoto(type, p.id).then(d=>{ if(d){ p.src = d; img.src = d; } });
+      t.querySelector('.rm').addEventListener('click', ()=>{ pics.splice(i,1); redraw(); });
+      t.querySelector('.lf').addEventListener('click', ()=>{ if(i>0){ [pics[i-1],pics[i]] = [pics[i],pics[i-1]]; redraw(); } });
+      t.querySelector('.rt').addEventListener('click', ()=>{ if(i<pics.length-1){ [pics[i+1],pics[i]] = [pics[i],pics[i+1]]; redraw(); } });
+      row.appendChild(t);
+    });
+    if(pics.length < max){
+      const add = document.createElement('button');
+      add.type = 'button';
+      add.className = 'shrink-0 w-24 h-32 border-2 border-dashed border-gray-300 rounded-xl flex flex-col items-center justify-center text-gray-400 gap-1 bg-gray-50/40';
+      add.innerHTML = `<span class="text-xl">＋</span><span class="add-label text-[10px] text-center px-1">${pics.length ? '사진 추가' : emptyLabel}</span><span class="text-[9px]">${pics.length}/${max}</span>`;
+      const inp = document.createElement('input');
+      inp.type = 'file'; inp.accept = 'image/*'; inp.multiple = true;
+      add.addEventListener('click', ()=>inp.click());
+      inp.addEventListener('change', async ()=>{
+        const all = Array.from(inp.files || []);
+        const files = all.slice(0, max - pics.length);
+        if(all.length > files.length) alert(`사진은 최대 ${max}장까지 올릴 수 있어요.`);
+        add.disabled = true; add.querySelector('.add-label').textContent = '처리 중…';
+        for(const f of files){ try{ pics.push({ id: uid('ph'), src: await readFileAsDataURL(f), fresh:true }); }catch(e){ console.error(e); } }
+        redraw();
+      });
+      row.appendChild(add);
+    }
+    el.appendChild(row);
+    if(pics.length > 1){
+      const hint = document.createElement('p');
+      hint.className = 'text-[10px] text-gray-400 mt-1';
+      hint.textContent = '첫 번째 사진이 대표예요 · ◀ ▶ 로 순서를 바꿔요';
+      el.appendChild(hint);
+    }
+  };
+  redraw();
+}
+// 상세 화면용 가로 스와이프 사진 (대표사진이 먼저)
+function buildCarousel(type, rec, imgCls, onTap){
+  const ids = photoIdsOf(rec);
+  const wrap = document.createElement('div');
+  wrap.className = 'relative';
+  const track = document.createElement('div');
+  track.className = 'flex overflow-x-auto snap-x snap-mandatory custom-scroll';
+  ids.forEach((id,i)=>{
+    const img = document.createElement('img');
+    img.className = 'min-w-full w-full snap-center ' + imgCls;
+    if(state.photoCache[id]) img.src = state.photoCache[id];
+    else { if(i===0) img.src = rec.photo || rec.photoThumb || ''; fetchPhoto(type, id).then(d=>{ if(d) img.src = d; }); }
+    img.addEventListener('click', ()=>onTap(img.src));
+    track.appendChild(img);
+  });
+  wrap.appendChild(track);
+  if(ids.length > 1){
+    const cnt = document.createElement('span');
+    cnt.className = 'absolute top-3 right-3 text-[11px] font-bold bg-black/50 text-white px-2 py-0.5 rounded-full pointer-events-none';
+    cnt.textContent = `1/${ids.length}`;
+    track.addEventListener('scroll', ()=>{ const i = Math.round(track.scrollLeft / (track.clientWidth||1)); cnt.textContent = `${Math.min(i,ids.length-1)+1}/${ids.length}`; });
+    wrap.appendChild(cnt);
+  }
+  return wrap;
+}
 try{
   if(firebaseConfig.apiKey !== "YOUR_API_KEY" && typeof firebase !== 'undefined'){
     firebase.initializeApp(firebaseConfig);
@@ -306,13 +429,14 @@ function makeThumbFromDataURL(dataURL){
 // 새 아이템 등록 폼의 빈 초안 생성 (모든 사이즈 필드를 미리 빈 값으로 포함)
 function blankItemForm(cat){
   const category = cat || CAT_MAIN[0];
-  const base = { category, subCategory: (CAT_SUB[category]||[])[0] || '', catExpand: null, photo:null, photoThumb:null, brand:'', name:'', modelNo:'', purchaseDate:'', price:'', store:'', sizeNote:'' };
+  const base = { category, subCategory: (CAT_SUB[category]||[])[0] || '', catExpand: null, photo:null, photoThumb:null, brand:'', name:'', modelNo:'', purchaseDate:'', price:'', store:'', sizeNote:'', pics:[] };
   SIZE_KEYS.forEach(k=>{ base[k] = ''; });
   return base;
 }
 // 기존 아이템 → 수정 폼 초안으로 변환
 function itemToForm(it){
   const base = blankItemForm(it.category);
+  base.pics = picsOf('item', it);
   base.subCategory = it.subCategory || (CAT_SUB[it.category]||[])[0] || '';
   base.photo = it.photo; base.photoThumb = it.photoThumb || null; base.brand = it.brand||''; base.name = it.name||''; base.modelNo = it.modelNo||'';
   base.purchaseDate = it.purchaseDate||''; base.price = it.price||''; base.store = it.store || parseSizeNote(it.sizeNote)['구매처'] || ''; base.sizeNote = it.sizeNote||'';
@@ -389,8 +513,9 @@ async function ensurePhotoLoaded(type, id){
 function fullPhotoOf(type, rec){
   if(!rec) return '';
   if(rec.photo) return rec.photo; // 방금 업로드/수정 중이라 메모리에 원본이 있는 경우
-  if(state.photoCache[rec.id]) return state.photoCache[rec.id];
-  ensurePhotoLoaded(type, rec.id);
+  const cid = photoIdsOf(rec)[0] || rec.id;
+  if(state.photoCache[cid]) return state.photoCache[cid];
+  ensurePhotoLoaded(type, cid);
   return rec.photoThumb || '';
 }
 
@@ -415,7 +540,7 @@ async function saveOutfitRecord(outfit){
   }
   if(photo) state.photoCache[outfit.id] = photo; // 방금 저장한 원본은 바로 캐시에 반영해서 재요청 안 하게
 }
-async function deleteOutfitRecord(id){
+async function deleteOutfitRecord(id, rec){
   if(state.storageMode === 'firebase'){
     try{ await db.collection('tagbook').doc(state.syncCode).collection('outfits').doc(id).delete(); }
     catch(e){ console.error('코디 삭제 실패:', e); }
@@ -427,6 +552,7 @@ async function deleteOutfitRecord(id){
   }
   delete state.photoCache[id];
   await deletePhoto('outfit', id);
+  if(rec) for(const pid of photoIdsOf(rec)){ if(pid !== id){ delete state.photoCache[pid]; await deletePhoto('outfit', pid); } }
 }
 async function saveItemRecord(item){
   const photo = item.photo;
@@ -449,7 +575,7 @@ async function saveItemRecord(item){
   }
   if(photo) state.photoCache[item.id] = photo;
 }
-async function deleteItemRecord(id){
+async function deleteItemRecord(id, rec){
   if(state.storageMode === 'firebase'){
     try{ await db.collection('tagbook').doc(state.syncCode).collection('items').doc(id).delete(); }
     catch(e){ console.error('아이템 삭제 실패:', e); }
@@ -461,6 +587,7 @@ async function deleteItemRecord(id){
   }
   delete state.photoCache[id];
   await deletePhoto('item', id);
+  if(rec) for(const pid of photoIdsOf(rec)){ if(pid !== id){ delete state.photoCache[pid]; await deletePhoto('item', pid); } }
 }
 
 // 예전 방식대로 문서 안에 원본(photo)이 통째로 박혀있는 코디/아이템을 찾아서
@@ -703,6 +830,7 @@ function render(){
   const newMain = document.getElementById('tab-main');
   if(newMain) newMain.scrollTop = tabScrollPositions[state.tab] || 0;
 
+  if(state.coordiDetailId !== lastCoordiId){ state.coordiFilterCat = 'all'; lastCoordiId = state.coordiDetailId; }
   if(state.registerDraft) addOverlay(app, 'reg', renderOutfitRegisterView());
   if(state.itemFlow) addOverlay(app, 'flow:'+state.itemFlow.mode, renderItemFlowModal());
   if(state.coordiDetailId) addOverlay(app, 'coordi', renderCoordiDetailModal());
@@ -1176,7 +1304,7 @@ function renderSearchTab(){
     const names = Array.from(groups.keys()).sort((a,b)=>{
       if(a==='브랜드 미상') return 1;
       if(b==='브랜드 미상') return -1;
-      return a.localeCompare(b,'ko');
+      return brandCmp(a,b);
     });
     const box = document.createElement('div');
     box.className = 'space-y-6';
@@ -1411,7 +1539,7 @@ function renderBottomNav(){
         tabScrollPositions[it.key] = 0;
         return;
       }
-      state.tab = it.key; render();
+      state.tab = it.key; state.searchQuery = ''; render();
     });
     nav.appendChild(b);
   });
@@ -1539,7 +1667,7 @@ function renderCoordiDetailModal(){
       </div>
     </div>
     <div class="p-4 space-y-4">
-      <img id="coordi-photo" src="${fullPhotoOf('outfit', o)}" class="w-full h-96 object-cover rounded-3xl shadow-md cursor-zoom-in" />
+      <div id="coordi-photo-wrap" class="rounded-3xl overflow-hidden shadow-md"></div>
       ${o.location ? `<div class="flex items-center gap-1.5 text-sm text-gray-700"><img src="${PIN_ICON}" class="w-3.5 h-3.5"/><span>${o.location}</span></div>` : ''}
       <div>
         <label class="text-xs font-bold text-gray-800">아이템 (${items.length}개)</label>
@@ -1571,9 +1699,9 @@ function renderCoordiDetailModal(){
     list.appendChild(card);
   });
   bg.querySelector('#close-coordi').addEventListener('click', ()=>{ state.coordiDetailId=null; render(); });
-  bg.querySelector('#coordi-photo').addEventListener('click', ()=>{ state.fullscreenPhoto = fullPhotoOf('outfit', o); render(); });
+  bg.querySelector('#coordi-photo-wrap').appendChild(buildCarousel('outfit', o, 'h-96 object-cover cursor-zoom-in', src=>{ if(src){ state.fullscreenPhoto = src; render(); } }));
   bg.querySelector('#edit-coordi').addEventListener('click', ()=>{
-    state.registerDraft = { date: o.date, location: o.location || '', photo: o.photo || null, photoThumb: o.photoThumb||null, itemIds: [...o.itemIds], editId: o.id };
+    state.registerDraft = { date: o.date, location: o.location || '', pics: picsOf('outfit', o), itemIds: [...o.itemIds], editId: o.id };
     state.coordiDetailId = null;
     render();
   });
@@ -1581,7 +1709,7 @@ function renderCoordiDetailModal(){
     askConfirm('이 코디 기록을 삭제할까요? (아이템 정보는 유지됩니다)', ()=>{
       state.outfits = state.outfits.filter(x=>x.id!==o.id);
       state.coordiDetailId = null;
-      deleteOutfitRecord(o.id);
+      deleteOutfitRecord(o.id, o);
       render();
     });
   });
@@ -1653,7 +1781,7 @@ function renderItemFullModal(){
       </div>
     </div>
     <div class="p-6 space-y-6">
-      <img src="${fullPhotoOf('item', it)}" class="w-full h-64 object-contain rounded-2xl bg-white p-4 border border-gray-100" />
+      <div id="item-photo-wrap" class="rounded-2xl overflow-hidden"></div>
       <div class="flex justify-between items-center">
         <div>
           <span class="text-xs text-gray-700 font-bold">${(it.brand||'브랜드 미상').toUpperCase()}</span>
@@ -1687,6 +1815,7 @@ function renderItemFullModal(){
   bg.querySelector('#close-full').addEventListener('click', ()=>{ state.itemFullId=null; render(); });
   const openFreq = bg.querySelector('#open-freq');
   if(openFreq) openFreq.addEventListener('click', ()=>{ state.itemFreqOutfitsId = it.id; render(); });
+  bg.querySelector('#item-photo-wrap').appendChild(buildCarousel('item', it, 'h-64 object-contain bg-white p-4 border border-gray-100 rounded-2xl', src=>{ if(src){ state.fullscreenPhoto = src; render(); } }));
   bg.querySelector('#edit-item').addEventListener('click', ()=>{
     state.itemFullId = null;
     state.itemFlow = { mode:'edit', itemId: it.id, form: itemToForm(it) };
@@ -1703,7 +1832,7 @@ function renderItemFullModal(){
       state.items = state.items.filter(x=>x.id!==it.id);
       state.outfits.forEach(o=>{ o.itemIds = o.itemIds.filter(id=>id!==it.id); });
       state.itemFullId = null;
-      deleteItemRecord(it.id);
+      deleteItemRecord(it.id, it);
       affectedOutfits.forEach(o=> saveOutfitRecord(o));
       render();
     });
@@ -1716,6 +1845,7 @@ function renderItemFullModal(){
    ============================================================ */
 function renderOutfitRegisterView(){
   const d = state.registerDraft;
+  d.pics = d.pics || [];
   const bg = document.createElement('div');
   bg.className = 'fixed inset-0 bg-[#F2F2F3] z-40 flex flex-col overflow-y-auto fade-enter';
   bg.innerHTML = `
@@ -1724,10 +1854,7 @@ function renderOutfitRegisterView(){
       <button id="cancel-register" class="text-xl font-bold p-1">✕</button>
     </div>
     <div class="p-4 space-y-4">
-      <div id="outfit-photo-drop" class="border-2 border-dashed border-gray-200 rounded-2xl bg-gray-50/40 flex flex-col items-center justify-center text-center p-6 cursor-pointer min-h-[220px] overflow-hidden relative">
-        ${(d.photo||d.photoThumb) ? `<img src="${d.photo||d.photoThumb}" class="absolute inset-0 w-full h-full object-cover rounded-2xl"/>` : `<div class="text-2xl mb-1">📷</div><p class="text-sm text-gray-800">코디 전체 사진</p><p class="text-xs text-gray-500 mt-1">클릭해서 업로드</p>`}
-        <input type="file" accept="image/*" id="outfit-photo-input"/>
-      </div>
+      <div id="outfit-photo-editor"></div>
       <div class="flex gap-3">
         <div class="w-[170px] shrink-0">
           <label class="text-xs font-bold text-gray-800">날짜</label>
@@ -1771,13 +1898,7 @@ function renderOutfitRegisterView(){
   addChip.addEventListener('click', ()=>{ state.itemFlow = { mode:'choice' }; render(); });
   chipList.appendChild(addChip);
 
-  const dropEl = bg.querySelector('#outfit-photo-drop');
-  const inputEl = bg.querySelector('#outfit-photo-input');
-  dropEl.addEventListener('click', ()=>inputEl.click());
-  inputEl.addEventListener('change', async e=>{
-    const f = e.target.files[0];
-    if(f){ d.photo = await readFileAsDataURL(f); d.photoThumb = await makeThumbFromDataURL(d.photo); render(); }
-  });
+  mountPhotoEditor(bg.querySelector('#outfit-photo-editor'), d.pics, 'outfit', '코디 전체 사진');
   bg.querySelector('#f-date').addEventListener('input', e=>{ d.date = e.target.value; });
   bg.querySelector('#f-loc').addEventListener('input', e=>{ d.location = e.target.value; });
   bg.querySelector('#cancel-register').addEventListener('click', ()=>{
@@ -1786,42 +1907,45 @@ function renderOutfitRegisterView(){
     if(editId) state.coordiDetailId = editId;
     render();
   });
-  bg.querySelector('#save-outfit').addEventListener('click', ()=>{
-    if(!d.photo && !d.photoThumb){ alert('코디 전체 사진을 업로드해주세요.'); return; }
+  bg.querySelector('#save-outfit').addEventListener('click', async ()=>{
+    if(d._saving) return;
+    if(!d.pics.length){ alert('코디 전체 사진을 업로드해주세요.'); return; }
     if(!d.date){ alert('날짜를 선택해주세요.'); return; }
 
     if(d.editId){
       // 수정 모드: 같은 날짜로 옮기려는 게 '다른' 기존 코디와 겹치는지만 확인
       const dupIdx = state.outfits.findIndex(o=>o.date===d.date && o.id!==d.editId);
-      let removedDupId = null;
+      let removedDupId = null, removedDupRec = null;
       if(dupIdx>-1){
         if(!confirm('해당 날짜에 이미 다른 코디가 있어요. 그 코디를 덮어쓸까요?')) return;
-        removedDupId = state.outfits[dupIdx].id;
+        removedDupId = state.outfits[dupIdx].id; removedDupRec = state.outfits[dupIdx];
         state.outfits.splice(dupIdx,1);
       }
       const idx = state.outfits.findIndex(o=>o.id===d.editId);
       let savedOutfit = null;
       if(idx>-1){
-        savedOutfit = { id: d.editId, date:d.date, location:d.location, photo:d.photo, photoThumb:d.photoThumb||null, itemIds:[...d.itemIds] };
+        savedOutfit = { id: d.editId, date:d.date, location:d.location, itemIds:[...d.itemIds] };
+        d._saving = true;
+        await persistPics('outfit', savedOutfit, d.pics, state.outfits[idx]);
         state.outfits[idx] = savedOutfit;
       }
       state.registerDraft = null;
       state.coordiDetailId = d.editId;
-      if(removedDupId) deleteOutfitRecord(removedDupId);
+      if(removedDupId) deleteOutfitRecord(removedDupId, removedDupRec);
       if(savedOutfit) saveOutfitRecord(savedOutfit);
       render();
       return;
     }
 
     const existingIdx = state.outfits.findIndex(o=>o.date===d.date);
-    const outfit = { id: uid('outfit'), date:d.date, location:d.location, photo:d.photo, photoThumb:d.photoThumb||null, itemIds:[...d.itemIds] };
+    const outfit = { id: uid('outfit'), date:d.date, location:d.location, itemIds:[...d.itemIds] };
     if(existingIdx>-1){
       if(!confirm('해당 날짜에 이미 코디가 있어요. 덮어쓸까요?')) return;
       outfit.id = state.outfits[existingIdx].id;
-      state.outfits[existingIdx] = outfit;
-    } else {
-      state.outfits.push(outfit);
     }
+    d._saving = true;
+    await persistPics('outfit', outfit, d.pics, existingIdx>-1 ? state.outfits[existingIdx] : null);
+    if(existingIdx>-1) state.outfits[existingIdx] = outfit; else state.outfits.push(outfit);
     state.registerDraft = null;
     state.coordiDetailId = outfit.id;
     saveOutfitRecord(outfit);
@@ -1902,6 +2026,7 @@ function renderItemFlowModal(){
   const sheet = document.createElement('div');
   sheet.className = 'bg-white rounded-t-3xl p-6 space-y-4 sheet-enter max-h-full overflow-y-auto overscroll-contain';
   const flow = state.itemFlow;
+  sheet.style.maxHeight = flow.mode === 'pick' ? 'calc(100% - 5.5rem)' : 'calc(100% - 2.5rem)';
 
   if(flow.mode === 'choice'){
     sheet.innerHTML = `
@@ -1914,7 +2039,7 @@ function renderItemFlowModal(){
       </div>
       <button id="close-flow" class="w-full py-2 text-xs text-gray-400">닫기</button>
     `;
-    sheet.querySelector('#pick-existing').addEventListener('click', ()=>{ state.itemFlow = { mode:'pick' }; render(); });
+    sheet.querySelector('#pick-existing').addEventListener('click', ()=>{ state.pickerSearch = ''; state.itemFlow = { mode:'pick' }; render(); });
     sheet.querySelector('#pick-new').addEventListener('click', ()=>{ state.itemFlow = { mode:'new', form: blankItemForm() }; render(); });
     sheet.querySelector('#close-flow').addEventListener('click', ()=>{ state.itemFlow=null; render(); });
   } else if(flow.mode === 'pick'){
@@ -1969,10 +2094,7 @@ function renderItemFlowModal(){
     sheet.innerHTML = `
       <div class="w-12 h-1 bg-gray-200 rounded-full mx-auto"></div>
       <h3 class="font-bold text-lg">${isEdit ? '아이템 수정' : '새 아이템 등록'}</h3>
-      <div id="item-photo-drop" class="border-2 border-dashed border-gray-200 rounded-2xl bg-gray-50/40 flex flex-col items-center justify-center text-center min-h-[110px] overflow-hidden relative cursor-pointer">
-        ${(f.photo||f.photoThumb) ? `<img src="${f.photo||f.photoThumb}" class="absolute inset-0 w-full h-full object-cover"/>` : `<div class="text-xl">🏷️</div><p class="text-xs text-gray-600 mt-1">아이템 사진 업로드</p>`}
-        <input type="file" accept="image/*" id="item-photo-input"/>
-      </div>
+      <div id="item-photo-editor"></div>
       <div>
         <label class="text-xs font-bold text-gray-800">카테고리</label>
         <div id="cat-accordion-wrap" class="mt-1"></div>
@@ -1996,13 +2118,8 @@ function renderItemFlowModal(){
         <button id="save-item" class="px-5 py-2.5 bg-gray-900 text-white text-sm font-bold rounded-xl">${isEdit ? '수정 완료' : '아이템 저장'}</button>
       </div>
     `;
-    const dropEl = sheet.querySelector('#item-photo-drop');
-    const inputEl = sheet.querySelector('#item-photo-input');
-    dropEl.addEventListener('click', ()=>inputEl.click());
-    inputEl.addEventListener('change', async e=>{
-      const file = e.target.files[0];
-      if(file){ f.photo = await readFileAsDataURL(file); f.photoThumb = await makeThumbFromDataURL(f.photo); render(); }
-    });
+    f.pics = f.pics || [];
+    mountPhotoEditor(sheet.querySelector('#item-photo-editor'), f.pics, 'item', '아이템 사진');
 
     // 카테고리: 대분류 → 소분류 인라인 아코디언
     renderCatAccordionInto(sheet.querySelector('#cat-accordion-wrap'), f);
@@ -2020,20 +2137,23 @@ function renderItemFlowModal(){
       if(isEdit){ state.itemFlow = null; state.itemFullId = flow.itemId; render(); }
       else { state.itemFlow = { mode:'choice' }; render(); }
     });
-    sheet.querySelector('#save-item').addEventListener('click', ()=>{
-      if(!f.photo && !f.photoThumb){ alert('아이템 사진을 업로드해주세요.'); return; }
+    sheet.querySelector('#save-item').addEventListener('click', async ()=>{
+      if(f._saving) return;
+      if(!f.pics.length){ alert('아이템 사진을 업로드해주세요.'); return; }
       if(!f.brand && !f.name){ alert('브랜드 또는 제품명을 입력해주세요.'); return; }
-      const payload = { category:f.category, subCategory:f.subCategory, photo:f.photo, photoThumb:f.photoThumb||null, brand:f.brand, name:f.name, modelNo:f.modelNo, purchaseDate:f.purchaseDate, price:f.price, store:f.store||'', sizeNote:f.sizeNote };
+      const payload = { category:f.category, subCategory:f.subCategory, brand:f.brand, name:f.name, modelNo:f.modelNo, purchaseDate:f.purchaseDate, price:f.price, store:f.store||'', sizeNote:f.sizeNote };
       SIZE_KEYS.forEach(k=>{ payload[k] = f[k]; });
       if(isEdit){
         const target = state.items.find(x=>x.id===flow.itemId);
-        if(target){ Object.assign(target, payload); }
+        if(target){ f._saving = true; Object.assign(target, payload); await persistPics('item', target, f.pics); }
         state.itemFlow = null;
         state.itemFullId = flow.itemId;
         if(target) saveItemRecord(target);
         render();
       } else {
         const newItem = Object.assign({ id: uid('item'), owned:true }, payload);
+        f._saving = true;
+        await persistPics('item', newItem, f.pics, null);
         state.items.push(newItem);
         if(state.registerDraft) state.registerDraft.itemIds.push(newItem.id);
         state.itemFlow = null;
